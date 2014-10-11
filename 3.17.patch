@@ -13,7 +13,7 @@ index 3524306..eb5cb47 100644
  
  static inline struct drm_i915_private *to_i915(const struct drm_device *dev)
 diff --git a/drivers/gpu/drm/i915/intel_dsi.c b/drivers/gpu/drm/i915/intel_dsi.c
-index 670c29a..a02ab48 100644
+index 670c29a..0e6c996 100644
 --- a/drivers/gpu/drm/i915/intel_dsi.c
 +++ b/drivers/gpu/drm/i915/intel_dsi.c
 @@ -163,6 +163,8 @@ static void intel_dsi_enable(struct intel_encoder *encoder)
@@ -25,7 +25,7 @@ index 670c29a..a02ab48 100644
  }
  
  static void intel_dsi_pre_enable(struct intel_encoder *encoder)
-@@ -237,21 +239,20 @@ static void intel_dsi_disable(struct intel_encoder *encoder)
+@@ -237,6 +239,8 @@ static void intel_dsi_disable(struct intel_encoder *encoder)
  	struct drm_i915_private *dev_priv = dev->dev_private;
  	struct intel_crtc *intel_crtc = to_intel_crtc(encoder->base.crtc);
  	struct intel_dsi *intel_dsi = enc_to_intel_dsi(&encoder->base);
@@ -34,28 +34,26 @@ index 670c29a..a02ab48 100644
  	int pipe = intel_crtc->pipe;
  	u32 temp;
  
- 	DRM_DEBUG_KMS("\n");
- 
--	if (is_vid_mode(intel_dsi)) {
--		wait_for_dsi_fifo_empty(intel_dsi);
+@@ -249,10 +253,17 @@ static void intel_dsi_disable(struct intel_encoder *encoder)
+ 		temp = I915_READ(MIPI_PORT_CTRL(pipe));
+ 		I915_WRITE(MIPI_PORT_CTRL(pipe), temp & ~DPI_ENABLE);
+ 		POSTING_READ(MIPI_PORT_CTRL(pipe));
 -
--		/* de-assert ip_tg_enable signal */
--		temp = I915_READ(MIPI_PORT_CTRL(pipe));
--		I915_WRITE(MIPI_PORT_CTRL(pipe), temp & ~DPI_ENABLE);
--		POSTING_READ(MIPI_PORT_CTRL(pipe));
++ 
+ 		msleep(2);
+ 	}
+ 
 +	intel_panel_disable_backlight(intel_connector);
 +	if (intel_dsi->backlight_off_delay >= 20)
 +		msleep(intel_dsi->backlight_off_delay);
 +	else
 +		usleep_range(intel_dsi->backlight_off_delay * 1000,
 +			(intel_dsi->backlight_off_delay * 1000) + 500);
- 
--		msleep(2);
--	}
- 
++
  	/* Panel commands can be sent when clock is in LP11 */
  	I915_WRITE(MIPI_DEVICE_READY(pipe), 0x0);
-@@ -664,6 +665,7 @@ static void intel_dsi_destroy(struct drm_connector *connector)
+ 
+@@ -664,6 +675,7 @@ static void intel_dsi_destroy(struct drm_connector *connector)
  
  	DRM_DEBUG_KMS("\n");
  	intel_panel_fini(&intel_connector->panel);
@@ -63,7 +61,7 @@ index 670c29a..a02ab48 100644
  	drm_connector_cleanup(connector);
  	kfree(connector);
  }
-@@ -779,7 +781,10 @@ void intel_dsi_init(struct drm_device *dev)
+@@ -779,7 +791,10 @@ void intel_dsi_init(struct drm_device *dev)
  	}
  
  	fixed_mode->type |= DRM_MODE_TYPE_PREFERRED;
