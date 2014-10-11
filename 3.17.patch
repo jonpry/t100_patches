@@ -1,0 +1,1437 @@
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 3524306..eb5cb47 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1624,6 +1624,9 @@ struct drm_i915_private {
+ 	 * NOTE: This is the dri1/ums dungeon, don't add stuff here. Your patch
+ 	 * will be rejected. Instead look for a better place.
+ 	 */
++	u16 is_mipi;
++	bool backlight_resume;
++	int backlight_on_delay;
+ };
+ 
+ static inline struct drm_i915_private *to_i915(const struct drm_device *dev)
+diff --git a/drivers/gpu/drm/i915/intel_dsi.c b/drivers/gpu/drm/i915/intel_dsi.c
+index 670c29a..a02ab48 100644
+--- a/drivers/gpu/drm/i915/intel_dsi.c
++++ b/drivers/gpu/drm/i915/intel_dsi.c
+@@ -163,6 +163,8 @@ static void intel_dsi_enable(struct intel_encoder *encoder)
+ 		I915_WRITE(MIPI_PORT_CTRL(pipe), temp | DPI_ENABLE);
+ 		POSTING_READ(MIPI_PORT_CTRL(pipe));
+ 	}
++
++	dev_priv->backlight_resume = true;
+ }
+ 
+ static void intel_dsi_pre_enable(struct intel_encoder *encoder)
+@@ -237,21 +239,20 @@ static void intel_dsi_disable(struct intel_encoder *encoder)
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	struct intel_crtc *intel_crtc = to_intel_crtc(encoder->base.crtc);
+ 	struct intel_dsi *intel_dsi = enc_to_intel_dsi(&encoder->base);
++	struct intel_connector *intel_connector =
++		&intel_dsi->attached_connector->base;
+ 	int pipe = intel_crtc->pipe;
+ 	u32 temp;
+ 
+ 	DRM_DEBUG_KMS("\n");
+ 
+-	if (is_vid_mode(intel_dsi)) {
+-		wait_for_dsi_fifo_empty(intel_dsi);
+-
+-		/* de-assert ip_tg_enable signal */
+-		temp = I915_READ(MIPI_PORT_CTRL(pipe));
+-		I915_WRITE(MIPI_PORT_CTRL(pipe), temp & ~DPI_ENABLE);
+-		POSTING_READ(MIPI_PORT_CTRL(pipe));
++	intel_panel_disable_backlight(intel_connector);
++	if (intel_dsi->backlight_off_delay >= 20)
++		msleep(intel_dsi->backlight_off_delay);
++	else
++		usleep_range(intel_dsi->backlight_off_delay * 1000,
++			(intel_dsi->backlight_off_delay * 1000) + 500);
+ 
+-		msleep(2);
+-	}
+ 
+ 	/* Panel commands can be sent when clock is in LP11 */
+ 	I915_WRITE(MIPI_DEVICE_READY(pipe), 0x0);
+@@ -664,6 +665,7 @@ static void intel_dsi_destroy(struct drm_connector *connector)
+ 
+ 	DRM_DEBUG_KMS("\n");
+ 	intel_panel_fini(&intel_connector->panel);
++	intel_panel_destroy_backlight(connector);
+ 	drm_connector_cleanup(connector);
+ 	kfree(connector);
+ }
+@@ -779,7 +781,10 @@ void intel_dsi_init(struct drm_device *dev)
+ 	}
+ 
+ 	fixed_mode->type |= DRM_MODE_TYPE_PREFERRED;
++	dev_priv->is_mipi = true;
++	dev_priv->backlight_on_delay = intel_dsi->backlight_on_delay;
+ 	intel_panel_init(&intel_connector->panel, fixed_mode, NULL);
++	intel_panel_setup_backlight(connector);
+ 
+ 	return;
+ 
+diff --git a/drivers/gpu/drm/i915/intel_panel.c b/drivers/gpu/drm/i915/intel_panel.c
+index 8e37444..4c3b9af 100644
+--- a/drivers/gpu/drm/i915/intel_panel.c
++++ b/drivers/gpu/drm/i915/intel_panel.c
+@@ -31,6 +31,7 @@
+ #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+ 
+ #include <linux/moduleparam.h>
++#include <linux/mfd/intel_mid_pmic.h>
+ #include "intel_drv.h"
+ 
+ void
+@@ -528,8 +529,11 @@ static u32 _vlv_get_backlight(struct drm_device *dev, enum pipe pipe)
+ static u32 vlv_get_backlight(struct intel_connector *connector)
+ {
+ 	struct drm_device *dev = connector->base.dev;
++	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	enum pipe pipe = intel_get_pipe_from_connector(connector);
+ 
++	if (dev_priv->is_mipi) 
++		return intel_mid_pmic_readb(0x4E);
+ 	return _vlv_get_backlight(dev, pipe);
+ }
+ 
+@@ -604,8 +608,11 @@ static void vlv_set_backlight(struct intel_connector *connector, u32 level)
+ 	enum pipe pipe = intel_get_pipe_from_connector(connector);
+ 	u32 tmp;
+ 
+-	tmp = I915_READ(VLV_BLC_PWM_CTL(pipe)) & ~BACKLIGHT_DUTY_CYCLE_MASK;
+-	I915_WRITE(VLV_BLC_PWM_CTL(pipe), tmp | level);
++	printk("VLV setbacklight %d\n", level);
++	intel_mid_pmic_writeb(0x4E, level);
++
++//	tmp = I915_READ(VLV_BLC_PWM_CTL(pipe)) & ~BACKLIGHT_DUTY_CYCLE_MASK;
++//	I915_WRITE(VLV_BLC_PWM_CTL(pipe), tmp | level);
+ }
+ 
+ static void
+@@ -631,8 +638,10 @@ static void intel_panel_set_backlight(struct intel_connector *connector,
+ 	u32 hw_level;
+ 	unsigned long flags;
+ 
+-	if (!panel->backlight.present || pipe == INVALID_PIPE)
+-		return;
++	printk("In intel panel %d\n", panel->backlight.present);
++
++//	if (!panel->backlight.present || pipe == INVALID_PIPE)
++//		return;
+ 
+ 	spin_lock_irqsave(&dev_priv->backlight_lock, flags);
+ 
+@@ -641,7 +650,7 @@ static void intel_panel_set_backlight(struct intel_connector *connector,
+ 	hw_level = scale_user_to_hw(connector, user_level, user_max);
+ 	panel->backlight.level = hw_level;
+ 
+-	if (panel->backlight.enabled)
++//	if (panel->backlight.enabled)
+ 		intel_panel_actually_set_backlight(connector, hw_level);
+ 
+ 	spin_unlock_irqrestore(&dev_priv->backlight_lock, flags);
+@@ -721,10 +730,16 @@ static void vlv_disable_backlight(struct intel_connector *connector)
+ 	enum pipe pipe = intel_get_pipe_from_connector(connector);
+ 	u32 tmp;
+ 
+-	intel_panel_actually_set_backlight(connector, 0);
++	vlv_set_backlight(connector, 0);
++
++	if (dev_priv->is_mipi) {
++
++//		intel_mid_pmic_writeb(0x51, 0x00);
++//		intel_mid_pmic_writeb(0x4B, 0x00);
++	}
+ 
+-	tmp = I915_READ(VLV_BLC_PWM_CTL2(pipe));
+-	I915_WRITE(VLV_BLC_PWM_CTL2(pipe), tmp & ~BLM_PWM_ENABLE);
++	//tmp = I915_READ(VLV_BLC_PWM_CTL2(pipe));
++	//I915_WRITE(VLV_BLC_PWM_CTL2(pipe), tmp & ~BLM_PWM_ENABLE);
+ }
+ 
+ void intel_panel_disable_backlight(struct intel_connector *connector)
+@@ -908,25 +923,15 @@ static void vlv_enable_backlight(struct intel_connector *connector)
+ 	enum pipe pipe = intel_get_pipe_from_connector(connector);
+ 	u32 ctl, ctl2;
+ 
+-	ctl2 = I915_READ(VLV_BLC_PWM_CTL2(pipe));
+-	if (ctl2 & BLM_PWM_ENABLE) {
+-		DRM_DEBUG_KMS("backlight already enabled\n");
+-		ctl2 &= ~BLM_PWM_ENABLE;
+-		I915_WRITE(VLV_BLC_PWM_CTL2(pipe), ctl2);
++	if (dev_priv->is_mipi) {
++		//intel_mid_pmic_writeb(0x4B, 0xFF);
++		//pbtest set pwm0clk 23.437kHz 20140207
++//			intel_mid_pmic_writeb(0x4B, 0x80);
++//			intel_mid_pmic_writeb(0x4E, 0xFF);
++//			intel_mid_pmic_writeb(0x51, 0x01);
+ 	}
+-
+-	ctl = panel->backlight.max << 16;
+-	I915_WRITE(VLV_BLC_PWM_CTL(pipe), ctl);
+-
+-	/* XXX: combine this into above write? */
++	/* This won't stick until the above enable. */
+ 	intel_panel_actually_set_backlight(connector, panel->backlight.level);
+-
+-	ctl2 = 0;
+-	if (panel->backlight.active_low_pwm)
+-		ctl2 |= BLM_POLARITY_I965;
+-	I915_WRITE(VLV_BLC_PWM_CTL2(pipe), ctl2);
+-	POSTING_READ(VLV_BLC_PWM_CTL2(pipe));
+-	I915_WRITE(VLV_BLC_PWM_CTL2(pipe), ctl2 | BLM_PWM_ENABLE);
+ }
+ 
+ void intel_panel_enable_backlight(struct intel_connector *connector)
+@@ -995,7 +1000,7 @@ static int intel_backlight_device_get_brightness(struct backlight_device *bd)
+ 
+ 	return ret;
+ }
+-
++	
+ static const struct backlight_ops intel_backlight_device_ops = {
+ 	.update_status = intel_backlight_device_update_status,
+ 	.get_brightness = intel_backlight_device_get_brightness,
+@@ -1009,7 +1014,7 @@ static int intel_backlight_device_register(struct intel_connector *connector)
+ 	if (WARN_ON(panel->backlight.device))
+ 		return -ENODEV;
+ 
+-	WARN_ON(panel->backlight.max == 0);
++	//WARN_ON(panel->backlight.max == 0);
+ 
+ 	memset(&props, 0, sizeof(props));
+ 	props.type = BACKLIGHT_RAW;
+@@ -1018,9 +1023,10 @@ static int intel_backlight_device_register(struct intel_connector *connector)
+ 	 * Note: Everything should work even if the backlight device max
+ 	 * presented to the userspace is arbitrarily chosen.
+ 	 */
+-	props.max_brightness = panel->backlight.max;
++	panel->backlight.present = 1;
++	props.max_brightness = panel->backlight.max = 0xFF; //JP HACK!!!
+ 	props.brightness = scale_hw_to_user(connector,
+-					    panel->backlight.level,
++					    panel->backlight.level = 20,
+ 					    props.max_brightness);
+ 
+ 	/*
+@@ -1203,6 +1209,10 @@ static int vlv_setup_backlight(struct intel_connector *connector)
+ 	enum pipe pipe;
+ 	u32 ctl, ctl2, val;
+ 
++	panel->backlight.enabled=1;
++
++        return 0;
++
+ 	for_each_pipe(pipe) {
+ 		u32 cur_val = I915_READ(VLV_BLC_PWM_CTL(pipe));
+ 
+diff --git a/drivers/hid/hid-rmi.c b/drivers/hid/hid-rmi.c
+index 8389e81..80e39b1 100644
+--- a/drivers/hid/hid-rmi.c
++++ b/drivers/hid/hid-rmi.c
+@@ -932,7 +932,7 @@ static void rmi_remove(struct hid_device *hdev)
+ }
+ 
+ static const struct hid_device_id rmi_id[] = {
+-	{ HID_DEVICE(HID_BUS_ANY, HID_GROUP_RMI, HID_ANY_ID, HID_ANY_ID) },
++	{ HID_DEVICE(HID_BUS_ANY, HID_GROUP_ANY, HID_ANY_ID, HID_ANY_ID) },
+ 	{ }
+ };
+ MODULE_DEVICE_TABLE(hid, rmi_id);
+diff --git a/drivers/mfd/Kconfig b/drivers/mfd/Kconfig
+index de5abf2..31d0d0b 100644
+--- a/drivers/mfd/Kconfig
++++ b/drivers/mfd/Kconfig
+@@ -10,6 +10,11 @@ config MFD_CORE
+ 	select IRQ_DOMAIN
+ 	default n
+ 
++config FOO
++	tristate
++	default m
++	select MFD_CORE
++
+ config MFD_CS5535
+ 	tristate "AMD CS5535 and CS5536 southbridge core functions"
+ 	select MFD_CORE
+diff --git a/drivers/mfd/Makefile b/drivers/mfd/Makefile
+index f001487..dc9e4d2 100644
+--- a/drivers/mfd/Makefile
++++ b/drivers/mfd/Makefile
+@@ -12,6 +12,7 @@ obj-$(CONFIG_MFD_BCM590XX)	+= bcm590xx.o
+ obj-$(CONFIG_MFD_CROS_EC)	+= cros_ec.o
+ obj-$(CONFIG_MFD_CROS_EC_I2C)	+= cros_ec_i2c.o
+ obj-$(CONFIG_MFD_CROS_EC_SPI)	+= cros_ec_spi.o
++obj-$(CONFIG_FOO)		+= intel_mid_pmic.o
+ 
+ rtsx_pci-objs			:= rtsx_pcr.o rts5209.o rts5229.o rtl8411.o rts5227.o rts5249.o
+ obj-$(CONFIG_MFD_RTSX_PCI)	+= rtsx_pci.o
+diff --git a/drivers/mfd/intel_mid_pmic.c b/drivers/mfd/intel_mid_pmic.c
+new file mode 100644
+index 0000000..de83e66
+--- /dev/null
++++ b/drivers/mfd/intel_mid_pmic.c
+@@ -0,0 +1,524 @@
++/*
++ * Crystal Cove  --  Device access for Intel PMIC for VLV2
++ *
++ * Copyright (c) 2013, Intel Corporation.
++ *
++ * Author: Yang Bin <bin.yang@intel.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation; version 2
++ * of the License.
++ */
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/delay.h>
++#include <linux/mfd/core.h>
++#include <linux/err.h>
++#include <linux/i2c.h>
++#include <linux/irq.h>
++#include <linux/interrupt.h>
++#include <linux/workqueue.h>
++#include <linux/mfd/intel_mid_pmic.h>
++#include <linux/acpi.h>
++
++
++#define VV_GPIO_BASE            0
++#define VV_GPIO_IRQBASE         256
++
++#define VV_NGPIO_SCORE          102
++#define VV_NGPIO_NCORE          28
++#define VV_NGPIO_SUS            44
++
++#define VV_PMIC_IRQBASE         456
++#define VV_PMIC_GPIO_IRQBASE    496
++#define VV_PMIC_GPIO_BASE       200
++
++
++#include <linux/version.h>
++
++#define PMIC_IRQ_NUM	7
++
++#define CHIPID		0x00
++#define CHIPVER		0x01
++#define IRQLVL1		0x02
++#define MIRQLVL1	0x0E
++enum {
++	PWRSRC_IRQ = 0,
++	THRM_IRQ,
++	BCU_IRQ,
++	ADC_IRQ,
++	CHGR_IRQ,
++	GPIO_IRQ,
++	VHDMIOCP_IRQ
++};
++
++struct intel_mid_pmic {
++	struct i2c_client *i2c;
++	struct mutex io_lock;
++	struct device *dev;
++	int irq;
++	struct mutex irq_lock;
++	int irq_base;
++	unsigned long irq_mask;
++	struct workqueue_struct *workqueue;
++	struct work_struct      work;
++};
++
++static struct device *gpio_dev;
++static struct resource gpio_resources[] = {
++	{
++		.name	= "GPIO",
++		.start	= GPIO_IRQ,
++		.end	= GPIO_IRQ,
++		.flags	= IORESOURCE_IRQ,
++	},
++};
++
++static struct resource pwrsrc_resources[] = {
++	{
++		.name  = "PWRSRC",
++		.start = PWRSRC_IRQ,
++		.end   = PWRSRC_IRQ,
++		.flags = IORESOURCE_IRQ,
++	},
++};
++
++static struct resource adc_resources[] = {
++	{
++		.name  = "ADC",
++		.start = ADC_IRQ,
++		.end   = ADC_IRQ,
++		.flags = IORESOURCE_IRQ,
++	},
++};
++
++static struct resource thermal_resources[] = {
++	{
++		.name  = "THERMAL",
++		.start = THRM_IRQ,
++		.end   = THRM_IRQ,
++		.flags = IORESOURCE_IRQ,
++	},
++};
++static struct resource bcu_resources[] = {
++	{
++		.name  = "BCU",
++		.start = BCU_IRQ,
++		.end   = BCU_IRQ,
++		.flags = IORESOURCE_IRQ,
++	},
++};
++static struct mfd_cell crystal_cove_data[] = {
++	{
++		.name = "crystal_cove_pwrsrc",
++		.id = 0,
++		.num_resources = ARRAY_SIZE(pwrsrc_resources),
++		.resources = pwrsrc_resources,
++	},
++	{
++		.name = "crystal_cove_adc",
++		.id = 0,
++		.num_resources = ARRAY_SIZE(adc_resources),
++		.resources = adc_resources,
++	},
++	{
++		.name = "crystal_cove_thermal",
++		.id = 0,
++		.num_resources = ARRAY_SIZE(thermal_resources),
++		.resources = thermal_resources,
++	},
++	{
++		.name = "crystal_cove_bcu",
++		.id = 0,
++		.num_resources = ARRAY_SIZE(bcu_resources),
++		.resources = bcu_resources,
++	},
++	{
++		.name = "crystal_cove_gpio",
++		.id = 0,
++		.num_resources = ARRAY_SIZE(gpio_resources),
++		.resources = gpio_resources,
++		.platform_data = &gpio_dev,
++		.pdata_size = sizeof(gpio_dev),
++	},
++	{NULL, },
++};
++
++int intel_mid_pmic_set_pdata(const char *name, void *data, int len)
++{
++	int i;
++	struct mfd_cell *cell;
++
++	for (i = 0; i < ARRAY_SIZE(crystal_cove_data); i++) {
++		cell = &crystal_cove_data[i];
++		if (!strcmp(cell->name, name)) {
++			cell->platform_data = data;
++			cell->pdata_size = len;
++			return 0;
++		}
++	}
++	return -EINVAL;
++}
++EXPORT_SYMBOL(intel_mid_pmic_set_pdata);
++
++/* wrapper function needed by Baytrail BCU driver */
++int intel_scu_ipc_read_mip(u8 *data, int len, int offset, int issigned)
++{
++	return 0;
++}
++EXPORT_SYMBOL(intel_scu_ipc_read_mip);
++
++static struct intel_mid_pmic intel_mid_pmic;
++static struct intel_mid_pmic *pmic = &intel_mid_pmic;
++
++/* These intel_scu_ipc_* APIs are formed to
++ * be compatible with old SCU IPC APIs.
++ */
++int intel_scu_ipc_ioread8(u16 addr, u8 *data)
++{
++	int ret;
++
++	ret = intel_mid_pmic_readb(addr);
++	if (ret < 0)
++		return ret;
++
++	*data = ret;
++	return 0;
++}
++EXPORT_SYMBOL(intel_scu_ipc_ioread8);
++
++int intel_scu_ipc_iowrite8(u16 addr, u8 data)
++{
++	return intel_mid_pmic_writeb(addr, data);
++}
++EXPORT_SYMBOL(intel_scu_ipc_iowrite8);
++
++int intel_scu_ipc_update_register(u16 addr, u8 data, u8 mask)
++{
++	int ret;
++
++	mutex_lock(&pmic->io_lock);
++
++	ret = i2c_smbus_read_byte_data(pmic->i2c, addr);
++	if (ret < 0)
++		goto err;
++
++	data &= mask;
++	ret &= ~mask;
++	ret |= data;
++
++	ret = i2c_smbus_write_byte_data(pmic->i2c, addr, ret);
++
++err:
++	mutex_unlock(&pmic->io_lock);
++	return ret;
++}
++EXPORT_SYMBOL(intel_scu_ipc_update_register);
++
++int intel_scu_ipc_readv(u16 *addr, u8 *data, int len)
++{
++	int i;
++	int ret;
++
++	if (len < 1 || len > 4)
++		return -EINVAL;
++
++	for (i = 0; i < len; i++) {
++		ret = intel_scu_ipc_ioread8(addr[i], &data[i]);
++		if (ret)
++			return ret;
++	}
++
++	return 0;
++}
++EXPORT_SYMBOL(intel_scu_ipc_readv);
++
++int intel_scu_ipc_writev(u16 *addr, u8 *data, int len)
++{
++	int i;
++	int ret;
++
++	if (len < 1 || len > 4)
++		return -EINVAL;
++
++	for (i = 0; i < len; i++) {
++		ret = intel_scu_ipc_iowrite8(addr[i], data[i]);
++		if (ret)
++			return ret;
++	}
++
++	return 0;
++}
++EXPORT_SYMBOL(intel_scu_ipc_writev);
++
++int intel_mid_pmic_readb(int reg)
++{
++	int ret;
++
++	mutex_lock(&pmic->io_lock);
++	ret = i2c_smbus_read_byte_data(pmic->i2c, reg);
++	mutex_unlock(&pmic->io_lock);
++	return ret;
++}
++EXPORT_SYMBOL(intel_mid_pmic_readb);
++
++int intel_mid_pmic_writeb(int reg, u8 val)
++{
++	int ret;
++
++	mutex_lock(&pmic->io_lock);
++	ret = i2c_smbus_write_byte_data(pmic->i2c, reg, val);
++	mutex_unlock(&pmic->io_lock);
++	return ret;
++}
++EXPORT_SYMBOL(intel_mid_pmic_writeb);
++
++int intel_mid_pmic_setb(int reg, u8 mask)
++{
++	int ret;
++	int val;
++
++	mutex_lock(&pmic->io_lock);
++	val = i2c_smbus_read_byte_data(pmic->i2c, reg);
++	val |= mask;
++	ret = i2c_smbus_write_byte_data(pmic->i2c, reg, val);
++	mutex_unlock(&pmic->io_lock);
++	return ret;
++}
++
++int intel_mid_pmic_clearb(int reg, u8 mask)
++{
++	int ret;
++	int val;
++
++	mutex_lock(&pmic->io_lock);
++	val = i2c_smbus_read_byte_data(pmic->i2c, reg);
++	val &= ~mask;
++	ret = i2c_smbus_write_byte_data(pmic->i2c, reg, val);
++	mutex_unlock(&pmic->io_lock);
++	return ret;
++}
++
++static void pmic_irq_enable(struct irq_data *data)
++{
++	clear_bit(data->irq - pmic->irq_base, &pmic->irq_mask);
++	queue_work(pmic->workqueue, &pmic->work);
++}
++
++static void pmic_irq_disable(struct irq_data *data)
++{
++	set_bit(data->irq - pmic->irq_base, &pmic->irq_mask);
++	queue_work(pmic->workqueue, &pmic->work);
++}
++
++static void pmic_irq_sync_unlock(struct irq_data *data)
++{
++	mutex_unlock(&pmic->irq_lock);
++}
++
++static void pmic_irq_lock(struct irq_data *data)
++{
++	mutex_lock(&pmic->irq_lock);
++}
++
++static void pmic_work(struct work_struct *work)
++{
++	mutex_lock(&pmic->irq_lock);
++	intel_mid_pmic_writeb(MIRQLVL1, (u8)pmic->irq_mask);
++	mutex_unlock(&pmic->irq_lock);
++}
++
++static irqreturn_t pmic_irq_isr(int irq, void *data)
++{
++	return IRQ_WAKE_THREAD;
++}
++
++static irqreturn_t pmic_irq_thread(int irq, void *data)
++{
++	int i;
++	int pending;
++
++	mutex_lock(&pmic->irq_lock);
++	intel_mid_pmic_writeb(MIRQLVL1, (u8)pmic->irq_mask);
++	pending = intel_mid_pmic_readb(IRQLVL1) & (~pmic->irq_mask);
++	for (i = 0; i < PMIC_IRQ_NUM; i++)
++		if (pending & (1 << i))
++			handle_nested_irq(pmic->irq_base + i);
++	mutex_unlock(&pmic->irq_lock);
++	return IRQ_HANDLED;
++}
++
++static struct irq_chip pmic_irq_chip = {
++	.name			= "intel_mid_pmic",
++	.irq_bus_lock		= pmic_irq_lock,
++	.irq_bus_sync_unlock	= pmic_irq_sync_unlock,
++	.irq_disable		= pmic_irq_disable,
++	.irq_enable		= pmic_irq_enable,
++};
++
++static void pmic_shutdown(struct i2c_client *client)
++{
++	dev_dbg(&client->dev, "%s called\n", __func__);
++
++	if (pmic->irq > 0)
++		disable_irq(pmic->irq);
++
++	return;
++}
++
++static int pmic_suspend(struct device *dev)
++{
++	dev_dbg(dev, "%s called\n", __func__);
++
++	if (pmic->irq > 0)
++		disable_irq(pmic->irq);
++
++	return 0;
++}
++
++static int pmic_resume(struct device *dev)
++{
++	dev_dbg(dev, "%s called\n", __func__);
++
++	if (pmic->irq > 0)
++		enable_irq(pmic->irq);
++
++	return 0;
++}
++
++static const struct dev_pm_ops pmic_pm_ops = {
++		SET_SYSTEM_SLEEP_PM_OPS(pmic_suspend,
++				pmic_resume)
++};
++
++static int pmic_irq_init(void)
++{
++	int cur_irq;
++	int ret;
++
++	pmic->irq_mask = 0xff;
++	intel_mid_pmic_writeb(MIRQLVL1, pmic->irq_mask);
++	pmic->irq_mask = intel_mid_pmic_readb(MIRQLVL1);
++	pmic->irq_base = irq_alloc_descs(VV_PMIC_IRQBASE, 0, PMIC_IRQ_NUM, 0);
++	if (pmic->irq_base < 0) {
++		dev_warn(pmic->dev, "Failed to allocate IRQs: %d\n",
++			 pmic->irq_base);
++		pmic->irq_base = 0;
++		return -EINVAL;
++	}
++
++	/* Register them with genirq */
++	for (cur_irq = pmic->irq_base;
++	     cur_irq < PMIC_IRQ_NUM + pmic->irq_base;
++	     cur_irq++) {
++		irq_set_chip_data(cur_irq, pmic);
++		irq_set_chip_and_handler(cur_irq, &pmic_irq_chip,
++					 handle_edge_irq);
++		irq_set_nested_thread(cur_irq, 1);
++		irq_set_noprobe(cur_irq);
++	}
++
++	ret = request_threaded_irq(pmic->irq, pmic_irq_isr, pmic_irq_thread,
++			IRQF_TRIGGER_RISING | IRQF_ONESHOT,
++			"intel_mid_pmic", pmic);
++	if (ret != 0) {
++		dev_err(pmic->dev, "Failed to request IRQ %d: %d\n",
++				pmic->irq, ret);
++		return ret;
++	}
++	ret = enable_irq_wake(pmic->irq);
++	if (ret != 0) {
++		dev_warn(pmic->dev, "Can't enable PMIC IRQ as wake source: %d\n",
++			 ret);
++	}
++
++	return 0;
++}
++
++static int pmic_i2c_probe(struct i2c_client *i2c,
++			    const struct i2c_device_id *id)
++{
++	int i;
++	struct mfd_cell *cell_dev = crystal_cove_data;
++
++	mutex_init(&pmic->io_lock);
++	mutex_init(&pmic->irq_lock);
++	pmic->workqueue =
++		create_singlethread_workqueue("crystal cove");
++	INIT_WORK(&pmic->work, pmic_work);
++	gpio_dev = &i2c->dev;
++	pmic->i2c = i2c;
++	pmic->dev = &i2c->dev;
++	pmic->irq = i2c->irq;
++	pmic_irq_init();
++	dev_info(&i2c->dev, "Crystal Cove: ID 0x%02X, VERSION 0x%02X\n",
++		intel_mid_pmic_readb(CHIPID), intel_mid_pmic_readb(CHIPVER));
++	for (i = 0; cell_dev[i].name != NULL; i++)
++		;
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 10, 1))
++	return mfd_add_devices(pmic->dev, -1, cell_dev, i,
++			NULL, pmic->irq_base, NULL);
++#else
++	return mfd_add_devices(pmic->dev, -1, cell_dev, i,
++			NULL, pmic->irq_base);
++#endif
++}
++
++static int pmic_i2c_remove(struct i2c_client *i2c)
++{
++	mfd_remove_devices(pmic->dev);
++	return 0;
++}
++
++static const struct i2c_device_id pmic_i2c_id[] = {
++	{ "crystal_cove", },
++	{ "INT33FD", },
++	{ }
++};
++MODULE_DEVICE_TABLE(i2c, pmic_i2c_id);
++
++static struct acpi_device_id pmic_acpi_match[] = {
++	{ "TEST0001", 0 },
++	{ "INT33FD", 0 },
++	{ },
++};
++MODULE_DEVICE_TABLE(acpi, pmic_acpi_match);
++
++static struct i2c_driver pmic_i2c_driver = {
++	.driver = {
++		.name = "intel_mid_i2c_pmic",
++		.owner = THIS_MODULE,
++		.pm = &pmic_pm_ops,
++		.acpi_match_table = ACPI_PTR(pmic_acpi_match),
++	},
++	.probe = pmic_i2c_probe,
++	.remove = pmic_i2c_remove,
++	.id_table = pmic_i2c_id,
++	.shutdown = pmic_shutdown,
++};
++
++static int __init pmic_i2c_init(void)
++{
++	int ret;
++
++	ret = i2c_add_driver(&pmic_i2c_driver);
++	if (ret != 0)
++		pr_err("Failed to register pmic I2C driver: %d\n", ret);
++
++	return ret;
++}
++subsys_initcall(pmic_i2c_init);
++
++static void __exit pmic_i2c_exit(void)
++{
++	i2c_del_driver(&pmic_i2c_driver);
++}
++module_exit(pmic_i2c_exit);
++
++MODULE_DESCRIPTION("Crystal Cove support for ValleyView2 PMIC");
++MODULE_LICENSE("GPL");
++MODULE_AUTHOR("Yang Bin <bin.yang@intel.com");
++
++
+diff --git a/drivers/mmc/core/core.c b/drivers/mmc/core/core.c
+index d03a080..2fbeddc 100644
+--- a/drivers/mmc/core/core.c
++++ b/drivers/mmc/core/core.c
+@@ -30,6 +30,8 @@
+ #include <linux/slab.h>
+ #include <linux/of.h>
+ 
++#define CSTATE_EXIT_LATENCY_C2   20 //#include <linux/intel_mid_pm.h>
++
+ #include <linux/mmc/card.h>
+ #include <linux/mmc/host.h>
+ #include <linux/mmc/mmc.h>
+@@ -238,6 +240,16 @@ mmc_start_request(struct mmc_host *host, struct mmc_request *mrq)
+ 	}
+ 	mmc_host_clk_hold(host);
+ 	led_trigger_event(host->led, LED_FULL);
++        if (host->qos) {
++ //               if (host->card && mmc_card_mmc(host->card) && mrq->data) {
++ //                       if (mrq->data->flags & MMC_DATA_WRITE)
++ //                               pm_qos_update_request(host->qos,
++ //                                               CSTATE_EXIT_LATENCY_C2);
++ //               } else
++ //                       pm_qos_update_request(host->qos,
++ //                                       CSTATE_EXIT_LATENCY_C2);
++        }
++
+ 	host->ops->request(host, mrq);
+ }
+ 
+@@ -452,6 +464,16 @@ static void mmc_wait_for_req_done(struct mmc_host *host,
+ 		cmd->error = 0;
+ 		host->ops->request(host, mrq);
+ 	}
++
++        if (host->qos) {
++ //               if (host->card && mmc_card_mmc(host->card) && mrq->data) {
++ //                       if (mrq->data->flags & MMC_DATA_WRITE)
++ //                               pm_qos_update_request(host->qos,
++ //                                               PM_QOS_DEFAULT_VALUE);
++ //               } else
++ //                       pm_qos_update_request(host->qos,
++ //                                       PM_QOS_DEFAULT_VALUE);
++        }
+ }
+ 
+ /**
+diff --git a/drivers/mmc/host/sdhci-acpi.c b/drivers/mmc/host/sdhci-acpi.c
+index 8c53370..a8a80eb 100644
+--- a/drivers/mmc/host/sdhci-acpi.c
++++ b/drivers/mmc/host/sdhci-acpi.c
+@@ -35,6 +35,7 @@
+ #include <linux/acpi.h>
+ #include <linux/pm.h>
+ #include <linux/pm_runtime.h>
++#include <linux/pm_qos.h>
+ #include <linux/delay.h>
+ 
+ #include <linux/mmc/host.h>
+@@ -42,6 +43,8 @@
+ #include <linux/mmc/slot-gpio.h>
+ #include <linux/mmc/sdhci.h>
+ 
++#include <asm/cpu_device_id.h>
++
+ #include "sdhci.h"
+ 
+ enum {
+@@ -67,6 +70,7 @@ struct sdhci_acpi_slot {
+ 	unsigned int	caps2;
+ 	mmc_pm_flag_t	pm_caps;
+ 	unsigned int	flags;
++	int 	(*probe_slot)(struct platform_device *pdev);
+ };
+ 
+ struct sdhci_acpi_host {
+@@ -101,10 +105,90 @@ static void sdhci_acpi_int_hw_reset(struct sdhci_host *host)
+ 	usleep_range(300, 1000);
+ }
+ 
++static int sdhci_acpi_get_tuning_count(struct sdhci_host *host)
++{
++	struct sdhci_acpi_host *c = sdhci_priv(host);
++	acpi_handle handle;
++	struct acpi_device *device;
++	struct acpi_device_info *info;
++	const char *hid, *uid = NULL;
++	acpi_status status;
++	int tuning_count = 0;
++
++	if (!c || !c->pdev)
++		return 0;
++
++	handle = ACPI_HANDLE(&c->pdev->dev);
++	if (acpi_bus_get_device(handle, &device))
++		return -ENODEV;
++
++	hid = acpi_device_hid(device);
++	status = acpi_get_object_info(handle, &info);
++	if (!ACPI_FAILURE(status) && (info->valid & ACPI_VALID_UID))
++		uid = info->unique_id.string;
++
++	if (!strcmp(hid, "80860F14") && !strcmp(uid, "1"))
++		tuning_count = 8;
++
++	return tuning_count;
++}
++
++#define INTEL_VLV_CPU	0x37
++#define INTEL_CHV_CPU	0x4c
++static const struct x86_cpu_id intel_cpus[] = {
++	{ X86_VENDOR_INTEL, 6, INTEL_VLV_CPU, X86_FEATURE_ANY, 0 },
++	{ X86_VENDOR_INTEL, 6, INTEL_CHV_CPU, X86_FEATURE_ANY, 0 },
++	{}
++};
++
++static bool sdhci_intel_host(unsigned int *cpu)
++{
++	const struct x86_cpu_id *id;
++	if (!cpu)
++		return false;
++	id = x86_match_cpu(intel_cpus);
++	if (!id)
++		return false;
++	*cpu = id->model;
++	return true;
++}
++
++static int sdhci_acpi_emmc_probe_slot(struct platform_device *pdev)
++{
++	struct sdhci_acpi_host *c = platform_get_drvdata(pdev);
++	struct sdhci_host *host;
++	unsigned int cpu;
++
++	if (!c || !c->host)
++		return 0;
++
++	host = c->host;
++
++	//TODO: host->mmc->caps2 |= MMC_CAP2_CACHE_CTRL;
++
++	if (!sdhci_intel_host(&cpu))
++		return 0;
++
++	switch (cpu) {
++	case INTEL_VLV_CPU:
++		host->mmc->qos = kzalloc(sizeof(struct pm_qos_request),
++				GFP_KERNEL);
++		pm_qos_add_request(host->mmc->qos, PM_QOS_CPU_DMA_LATENCY,
++				PM_QOS_DEFAULT_VALUE);
++		break;
++	default:
++		break;
++	}
++
++	return 0;
++}
++
++
+ static const struct sdhci_ops sdhci_acpi_ops_dflt = {
+ 	.set_clock = sdhci_set_clock,
+ 	.enable_dma = sdhci_acpi_enable_dma,
+ 	.set_bus_width = sdhci_set_bus_width,
++	.get_tuning_count = sdhci_acpi_get_tuning_count,
+ 	.reset = sdhci_reset,
+ 	.set_uhs_signaling = sdhci_set_uhs_signaling,
+ };
+@@ -126,17 +210,19 @@ static const struct sdhci_acpi_slot sdhci_acpi_slot_int_emmc = {
+ 	.chip    = &sdhci_acpi_chip_int,
+ 	.caps    = MMC_CAP_8_BIT_DATA | MMC_CAP_NONREMOVABLE |
+ 		   MMC_CAP_HW_RESET | MMC_CAP_1_8V_DDR,
+-	.caps2   = MMC_CAP2_HC_ERASE_SZ,
++	.caps2   = MMC_CAP2_HC_ERASE_SZ | MMC_CAP2_HS200_1_8V_SDR,
+ 	.flags   = SDHCI_ACPI_RUNTIME_PM,
+-	.quirks2 = SDHCI_QUIRK2_PRESET_VALUE_BROKEN,
++	.quirks2 = SDHCI_QUIRK2_CARD_CD_DELAY | SDHCI_QUIRK2_WAIT_FOR_IDLE |
++		SDHCI_QUIRK2_PRESET_VALUE_BROKEN | SDHCI_QUIRK2_TUNING_POLL,
++        .probe_slot = sdhci_acpi_emmc_probe_slot,
+ };
+ 
+ static const struct sdhci_acpi_slot sdhci_acpi_slot_int_sdio = {
+ 	.quirks  = SDHCI_QUIRK_BROKEN_CARD_DETECTION,
+-	.quirks2 = SDHCI_QUIRK2_HOST_OFF_CARD_ON,
++        .quirks2 = SDHCI_QUIRK2_HOST_OFF_CARD_ON | SDHCI_QUIRK2_BROKEN_POWER_ENABLE,
+ 	.caps    = MMC_CAP_NONREMOVABLE | MMC_CAP_POWER_OFF_CARD,
+-	.flags   = SDHCI_ACPI_RUNTIME_PM,
+-	.pm_caps = MMC_PM_KEEP_POWER,
++	.flags   = 0,//SDHCI_ACPI_RUNTIME_PM,
++	.pm_caps = MMC_PM_KEEP_POWER | MMC_PM_WAKE_SDIO_IRQ,
+ };
+ 
+ static const struct sdhci_acpi_slot sdhci_acpi_slot_int_sd = {
+@@ -277,6 +363,12 @@ static int sdhci_acpi_probe(struct platform_device *pdev)
+ 	}
+ 
+ 	if (c->slot) {
++                if (c->slot->probe_slot) {
++                        err = c->slot->probe_slot(pdev);
++                        if (err)
++                                goto err_free;
++                }
++
+ 		if (c->slot->chip) {
+ 			host->ops            = c->slot->chip->ops;
+ 			host->quirks        |= c->slot->chip->quirks;
+diff --git a/drivers/mmc/host/sdhci.c b/drivers/mmc/host/sdhci.c
+index 37b2a9a..5c26a20 100644
+--- a/drivers/mmc/host/sdhci.c
++++ b/drivers/mmc/host/sdhci.c
+@@ -29,6 +29,7 @@
+ #include <linux/mmc/host.h>
+ #include <linux/mmc/card.h>
+ #include <linux/mmc/slot-gpio.h>
++#include <linux/gpio.h>
+ 
+ #include "sdhci.h"
+ 
+@@ -165,6 +166,21 @@ static void sdhci_disable_card_detection(struct sdhci_host *host)
+ 	sdhci_set_card_detection(host, false);
+ }
+ 
++static void sdhci_busy_wait(struct mmc_host *mmc, u32 delay)
++{
++	struct sdhci_host *host = mmc_priv(mmc);
++
++	/* totally 'delay' us, each loop 4us */
++	u32 loop = delay / 4;
++	while (loop) {
++		/* have a delay here */
++		udelay(4);
++		/* read register to make sure host won't be clock gated */
++		sdhci_readw(host, SDHCI_HOST_VERSION);
++		loop--;
++	}
++}
++
+ void sdhci_reset(struct sdhci_host *host, u8 mask)
+ {
+ 	unsigned long timeout;
+@@ -957,6 +973,8 @@ static void sdhci_finish_data(struct sdhci_host *host)
+ 		 * upon error conditions.
+ 		 */
+ 		if (data->error) {
++			if (host->quirks2 & SDHCI_QUIRK2_WAIT_FOR_IDLE)
++				sdhci_busy_wait(host->mmc, 1000);
+ 			sdhci_do_reset(host, SDHCI_RESET_CMD);
+ 			sdhci_do_reset(host, SDHCI_RESET_DATA);
+ 		}
+@@ -1220,6 +1238,10 @@ clock_set:
+ }
+ EXPORT_SYMBOL_GPL(sdhci_set_clock);
+ 
++static inline void sdhci_set_power_quirk(unsigned short power) {
++       gpio_set_value(SDHCI_POWER_QUIRK_GPIO, power);
++}
++
+ static void sdhci_set_power(struct sdhci_host *host, unsigned char mode,
+ 			    unsigned short vdd)
+ {
+@@ -1260,6 +1282,10 @@ static void sdhci_set_power(struct sdhci_host *host, unsigned char mode,
+ 		sdhci_writeb(host, 0, SDHCI_POWER_CONTROL);
+ 		if (host->quirks2 & SDHCI_QUIRK2_CARD_ON_NEEDS_BUS_ON)
+ 			sdhci_runtime_pm_bus_off(host);
++
++               /* The intel Bay Trail SoCs need to assert a GPIO as a work around */
++               if (host->quirks2 & SDHCI_QUIRK2_BROKEN_POWER_ENABLE)
++                       sdhci_set_power_quirk(0);
+ 		vdd = 0;
+ 	} else {
+ 		/*
+@@ -1284,6 +1310,15 @@ static void sdhci_set_power(struct sdhci_host *host, unsigned char mode,
+ 		if (host->quirks2 & SDHCI_QUIRK2_CARD_ON_NEEDS_BUS_ON)
+ 			sdhci_runtime_pm_bus_on(host);
+ 
++
++
++        	sdhci_writeb(host, pwr, SDHCI_POWER_CONTROL);
++
++       		/* The intel Bay Trail SoCs need to assert a GPIO as a work around */
++       		if (host->quirks2 & SDHCI_QUIRK2_BROKEN_POWER_ENABLE)
++               		sdhci_set_power_quirk(1);
++
++
+ 		/*
+ 		 * Some controllers need an extra 10ms delay of 10ms before
+ 		 * they can apply clock after applying power
+@@ -1827,6 +1862,7 @@ static int sdhci_execute_tuning(struct mmc_host *mmc, u32 opcode)
+ 	u16 ctrl;
+ 	int tuning_loop_counter = MAX_TUNING_LOOP;
+ 	int err = 0;
++	unsigned long timeout;
+ 	unsigned long flags;
+ 
+ 	sdhci_runtime_pm_get(host);
+@@ -1884,9 +1920,12 @@ static int sdhci_execute_tuning(struct mmc_host *mmc, u32 opcode)
+ 	 * Issue CMD19 repeatedly till Execute Tuning is set to 0 or the number
+ 	 * of loops reaches 40 times or a timeout of 150ms occurs.
+ 	 */
++	timeout = 150;
+ 	do {
+ 		struct mmc_command cmd = {0};
+ 		struct mmc_request mrq = {NULL};
++		unsigned int intmask;
++		unsigned long t = jiffies + msecs_to_jiffies(150);
+ 
+ 		cmd.opcode = opcode;
+ 		cmd.arg = 0;
+@@ -1931,12 +1970,25 @@ static int sdhci_execute_tuning(struct mmc_host *mmc, u32 opcode)
+ 		host->cmd = NULL;
+ 		host->mrq = NULL;
+ 
+-		spin_unlock_irqrestore(&host->lock, flags);
+-		/* Wait for Buffer Read Ready interrupt */
+-		wait_event_interruptible_timeout(host->buf_ready_int,
++		if (host->quirks2 & SDHCI_QUIRK2_TUNING_POLL) {
++			while (!time_after(jiffies, t)) {
++				intmask = sdhci_readl(host, SDHCI_INT_STATUS);
++				if (intmask & SDHCI_INT_DATA_AVAIL) {
++					host->tuning_done = 1;
++					sdhci_writel(host,
++						intmask & SDHCI_INT_DATA_AVAIL,
++						SDHCI_INT_STATUS);
++					break;
++				}
++			}
++		} else {
++			spin_unlock_irqrestore(&host->lock, flags);
++			/* Wait for Buffer Read Ready interrupt */
++			wait_event_interruptible_timeout(host->buf_ready_int,
+ 					(host->tuning_done == 1),
+ 					msecs_to_jiffies(50));
+-		spin_lock_irqsave(&host->lock, flags);
++			spin_lock_irqsave(&host->lock, flags);
++		}
+ 
+ 		if (!host->tuning_done) {
+ 			pr_info(DRIVER_NAME ": Timeout waiting for "
+@@ -1954,6 +2006,9 @@ static int sdhci_execute_tuning(struct mmc_host *mmc, u32 opcode)
+ 
+ 		host->tuning_done = 0;
+ 
++		if (timeout)
++			timeout--;
++
+ 		ctrl = sdhci_readw(host, SDHCI_HOST_CONTROL2);
+ 
+ 		/* eMMC spec does not require a delay between tuning cycles */
+@@ -2064,6 +2119,8 @@ static void sdhci_card_event(struct mmc_host *mmc)
+ 		pr_err("%s: Resetting controller.\n",
+ 			mmc_hostname(host->mmc));
+ 
++		if (host->quirks2 & SDHCI_QUIRK2_WAIT_FOR_IDLE)
++			sdhci_busy_wait(mmc, 1000);
+ 		sdhci_do_reset(host, SDHCI_RESET_CMD);
+ 		sdhci_do_reset(host, SDHCI_RESET_DATA);
+ 
+@@ -2133,6 +2190,8 @@ static void sdhci_tasklet_finish(unsigned long param)
+ 
+ 		/* Spec says we should do both at the same time, but Ricoh
+ 		   controllers do not like that. */
++		if (host->quirks2 & SDHCI_QUIRK2_WAIT_FOR_IDLE)
++			sdhci_busy_wait(host->mmc, 1000);
+ 		sdhci_do_reset(host, SDHCI_RESET_CMD);
+ 		sdhci_do_reset(host, SDHCI_RESET_DATA);
+ 	}
+@@ -2574,6 +2633,29 @@ int sdhci_resume_host(struct sdhci_host *host)
+ {
+ 	int ret = 0;
+ 
++	if (host->quirks2 & SDHCI_QUIRK2_CARD_CD_DELAY) {
++		int loop = 0;
++		unsigned int present;
++		present = sdhci_readl(host, SDHCI_PRESENT_STATE) &
++			SDHCI_CARD_PRESENT;
++		/*
++		 * delay 10ms to wait for present register stable
++		 * try 5 loops, and each loops will wait 2ms
++		 */
++		while (!present && loop < 5) {
++			/* BYT eMMC4.5 silicon issue workaround: 4599639 */
++			mdelay(2);
++			present = sdhci_readl(host, SDHCI_PRESENT_STATE) &
++				SDHCI_CARD_PRESENT;
++			loop++;
++		}
++		if (loop == 5) {
++			WARN_ON(1);
++			pr_warn("%s %s: PRESENT bit16 is not recover\n",
++					__func__, mmc_hostname(host->mmc));
++		}
++	}
++
+ 	if (host->flags & (SDHCI_USE_SDMA | SDHCI_USE_ADMA)) {
+ 		if (host->ops->enable_dma)
+ 			host->ops->enable_dma(host);
+@@ -2653,6 +2735,10 @@ int sdhci_runtime_suspend_host(struct sdhci_host *host)
+ 		host->flags &= ~SDHCI_NEEDS_RETUNING;
+ 	}
+ 
++        if (host->mmc->qos)
++	       pm_qos_update_request(host->mmc->qos, PM_QOS_DEFAULT_VALUE);
++
++
+ 	spin_lock_irqsave(&host->lock, flags);
+ 	host->ier &= SDHCI_INT_CARD_INT;
+ 	sdhci_writel(host, host->ier, SDHCI_INT_ENABLE);
+@@ -2674,6 +2760,30 @@ int sdhci_runtime_resume_host(struct sdhci_host *host)
+ 	unsigned long flags;
+ 	int host_flags = host->flags;
+ 
++	if (host->quirks2 & SDHCI_QUIRK2_CARD_CD_DELAY) {
++		int loop = 0;
++		unsigned int present;
++		present = sdhci_readl(host, SDHCI_PRESENT_STATE) &
++			SDHCI_CARD_PRESENT;
++		/*
++		 * delay 10ms to wait for present register stable
++		 * try 5 loops, and each loops will wait 2ms
++		 */
++		while (!present && loop < 5) {
++			/* BYT eMMC4.5 silicon issue workaround: 4599639 */
++			mdelay(2);
++			present = sdhci_readl(host, SDHCI_PRESENT_STATE) &
++				SDHCI_CARD_PRESENT;
++			loop++;
++		}
++		if (loop == 5) {
++			WARN_ON(1);
++			pr_warn("%s %s: PRESENT bit16 is not recover\n",
++					__func__, mmc_hostname(host->mmc));
++
++		}
++	}
++
+ 	if (host_flags & (SDHCI_USE_SDMA | SDHCI_USE_ADMA)) {
+ 		if (host->ops->enable_dma)
+ 			host->ops->enable_dma(host);
+@@ -2711,6 +2821,10 @@ int sdhci_runtime_resume_host(struct sdhci_host *host)
+ 
+ 	spin_unlock_irqrestore(&host->lock, flags);
+ 
++       if (host->mmc->qos)
++              pm_qos_update_request(host->mmc->qos, 20);	
++
++
+ 	return 0;
+ }
+ EXPORT_SYMBOL_GPL(sdhci_runtime_resume_host);
+@@ -2816,6 +2930,18 @@ int sdhci_add_host(struct sdhci_host *host)
+ 		}
+ 	}
+ 
++    	if ((host->quirks2 & SDHCI_QUIRK2_BROKEN_POWER_ENABLE)) {
++        	printk("Using GPIO for power enable as it is marked broken\n");
++        	if (gpio_request(SDHCI_POWER_QUIRK_GPIO, "SDIO_PWR_EN") < 0) {
++            		printk("Unable to request GPIO. SDIO may be broken.");
++                       	host->quirks2 = host->quirks2 & ~SDHCI_QUIRK2_BROKEN_POWER_ENABLE;
++        	}
++        	else if (gpio_direction_output(SDHCI_POWER_QUIRK_GPIO, 0) < 0) {
++            		printk("Unable to set GPIO direction. SDIO may be broken.");
++                       		host->quirks2 = host->quirks2 & ~SDHCI_QUIRK2_BROKEN_POWER_ENABLE;
++        	}
++    	}
++
+ 	if (host->flags & SDHCI_USE_ADMA) {
+ 		/*
+ 		 * We need to allocate descriptors for all sg entries
+@@ -3027,6 +3153,9 @@ int sdhci_add_host(struct sdhci_host *host)
+ 	host->tuning_count = (caps[1] & SDHCI_RETUNING_TIMER_COUNT_MASK) >>
+ 			      SDHCI_RETUNING_TIMER_COUNT_SHIFT;
+ 
++	if (host->tuning_count == 0 && host->ops->get_tuning_count)
++		host->tuning_count = host->ops->get_tuning_count(host);
++
+ 	/*
+ 	 * In case Re-tuning Timer is not disabled, the actual value of
+ 	 * re-tuning timer will be 2 ^ (n - 1).
+@@ -3292,6 +3421,10 @@ void sdhci_remove_host(struct sdhci_host *host, int dead)
+ 	if (!IS_ERR(mmc->supply.vqmmc))
+ 		regulator_disable(mmc->supply.vqmmc);
+ 
++    	if (host->quirks2 & SDHCI_QUIRK2_BROKEN_POWER_ENABLE) {
++        	gpio_free(SDHCI_POWER_QUIRK_GPIO);
++    	}
++
+ 	if (host->adma_desc)
+ 		dma_free_coherent(mmc_dev(mmc), ADMA_SIZE,
+ 				  host->adma_desc, host->adma_addr);
+diff --git a/drivers/mmc/host/sdhci.h b/drivers/mmc/host/sdhci.h
+index 4a5cd5e..ef27426 100644
+--- a/drivers/mmc/host/sdhci.h
++++ b/drivers/mmc/host/sdhci.h
+@@ -252,6 +252,8 @@
+ #define   SDHCI_SPEC_200	1
+ #define   SDHCI_SPEC_300	2
+ 
++#define SDHCI_POWER_QUIRK_GPIO 195 /*GPIO offset 41 of SCORE device is SD3_PWR_EN*/
++
+ /*
+  * End of controller registers.
+  */
+@@ -292,6 +294,7 @@ struct sdhci_ops {
+ 	void    (*adma_workaround)(struct sdhci_host *host, u32 intmask);
+ 	void	(*platform_init)(struct sdhci_host *host);
+ 	void    (*card_event)(struct sdhci_host *host);
++	int	(*get_tuning_count)(struct sdhci_host *host);
+ };
+ 
+ #ifdef CONFIG_MMC_SDHCI_IO_ACCESSORS
+diff --git a/drivers/pinctrl/pinctrl-baytrail.c b/drivers/pinctrl/pinctrl-baytrail.c
+index e12e5b0..d56a565 100644
+--- a/drivers/pinctrl/pinctrl-baytrail.c
++++ b/drivers/pinctrl/pinctrl-baytrail.c
+@@ -160,9 +160,9 @@ static void __iomem *byt_gpio_reg(struct gpio_chip *chip, unsigned offset,
+ 
+ static bool is_special_pin(struct byt_gpio *vg, unsigned offset)
+ {
+-	/* SCORE pin 92-93 */
++	/* SCORE pin 92-93, 41 for SDIO pwr_en bug */
+ 	if (!strcmp(vg->range->name, BYT_SCORE_ACPI_UID) &&
+-		offset >= 92 && offset <= 93)
++		((offset >= 92 && offset <= 93) || offset == 41))
+ 		return true;
+ 
+ 	/* SUS pin 11-21 */
+@@ -185,7 +185,13 @@ static int byt_gpio_request(struct gpio_chip *chip, unsigned offset)
+ 	 * But, some pins may have func pin mux 001 represents
+ 	 * GPIO function. Only allow user to export pin with
+ 	 * func pin mux preset as GPIO function by BIOS/FW.
++     	 *
++     	 * We do make an exception, however, for pin 41 which
++     	 * is needed in order to power up the SDIO bus (as per
++     	 * the intel erratum)
+ 	 */
++
++
+ 	value = readl(reg) & BYT_PIN_MUX;
+ 	special = is_special_pin(vg, offset);
+ 	if ((special && value != 1) || (!special && value)) {
+@@ -194,6 +200,13 @@ static int byt_gpio_request(struct gpio_chip *chip, unsigned offset)
+ 		return -EINVAL;
+ 	}
+ 
++	/* This is an attempt to stop the SDHCI drivers from requesting IRQ lines
++	 * through the pinctrl driver. This may be a quirk in the hardware or it
++	 * may be a bug here in the IRQ handling
++	 */
++//	if (offset == 38)
++//		return -EINVAL;
++
+ 	pm_runtime_get(&vg->pdev->dev);
+ 
+ 	return 0;
+@@ -227,10 +240,15 @@ static int byt_irq_type(struct irq_data *d, unsigned type)
+ 	spin_lock_irqsave(&vg->lock, flags);
+ 	value = readl(reg);
+ 
+-	/* For level trigges the BYT_TRIG_POS and BYT_TRIG_NEG bits
+-	 * are used to indicate high and low level triggering
+-	 */
+-	value &= ~(BYT_TRIG_POS | BYT_TRIG_NEG | BYT_TRIG_LVL);
++	WARN(value & BYT_DIRECT_IRQ_EN,
++		"Bad pad config for io mode, force direct_irq_en bit clearing");
++
++ 	/* For level trigges the BYT_TRIG_POS and BYT_TRIG_NEG bits
++ 	 * are used to indicate high and low level triggering
++ 	 */
++	value &= ~(BYT_DIRECT_IRQ_EN | BYT_TRIG_POS | BYT_TRIG_NEG |
++		   BYT_TRIG_LVL);
++
+ 
+ 	switch (type) {
+ 	case IRQ_TYPE_LEVEL_HIGH:
+diff --git a/include/linux/mfd/intel_mid_pmic.h b/include/linux/mfd/intel_mid_pmic.h
+new file mode 100644
+index 0000000..70fd22c
+--- /dev/null
++++ b/include/linux/mfd/intel_mid_pmic.h
+@@ -0,0 +1,11 @@
++#ifndef __CRYSTAL_COVE_H__
++#define __CRYSTAL_COVE_H__
++
++int intel_mid_pmic_readb(int reg);
++int intel_mid_pmic_writeb(int reg, u8 val);
++int intel_mid_pmic_setb(int reg, u8 mask);
++int intel_mid_pmic_clearb(int reg, u8 mask);
++int intel_mid_pmic_set_pdata(const char *name, void *data, int len);
++
++#endif
++
+diff --git a/include/linux/mmc/host.h b/include/linux/mmc/host.h
+index 7960424..7058c8c 100644
+--- a/include/linux/mmc/host.h
++++ b/include/linux/mmc/host.h
+@@ -19,6 +19,7 @@
+ #include <linux/mmc/core.h>
+ #include <linux/mmc/card.h>
+ #include <linux/mmc/pm.h>
++#include <linux/pm_qos.h>
+ 
+ struct mmc_ios {
+ 	unsigned int	clock;			/* clock rate */
+@@ -365,6 +366,8 @@ struct mmc_host {
+ 
+ 	unsigned int		slotno;	/* used for sdio acpi binding */
+ 
++	struct pm_qos_request *qos;
++
+ 	unsigned long		private[0] ____cacheline_aligned;
+ };
+ 
+diff --git a/include/linux/mmc/sdhci.h b/include/linux/mmc/sdhci.h
+index 09ebe57..8aca19c 100644
+--- a/include/linux/mmc/sdhci.h
++++ b/include/linux/mmc/sdhci.h
+@@ -98,6 +98,19 @@ struct sdhci_host {
+ #define SDHCI_QUIRK2_BROKEN_HS200			(1<<6)
+ /* Controller does not support DDR50 */
+ #define SDHCI_QUIRK2_BROKEN_DDR50			(1<<7)
++/* Controller cannot initialize power (must use GPIO instead) */
++#define SDHCI_QUIRK2_BROKEN_POWER_ENABLE               (1<<8)
++
++#define SDHCI_QUIRK2_TUNING_SLEEP                       (1<<23)
++#define SDHCI_QUIRK2_CARD_CD_DELAY                      (1<<24)
++#define SDHCI_QUIRK2_WAIT_FOR_IDLE                      (1<<25)
++/* BAD sd cd in HOST IC. This will cause system hang when removing SD */
++#define SDHCI_QUIRK2_BAD_SD_CD                          (1<<26)
++#define SDHCI_QUIRK2_POWER_PIN_GPIO_MODE                (1<<27)
++#define SDHCI_QUIRK2_NON_STD_CIS   (1<<29)
++#define SDHCI_QUIRK2_TUNING_POLL                        (1<<30)
++
++
+ 
+ 	int irq;		/* Device IRQ */
+ 	void __iomem *ioaddr;	/* Mapped address */
