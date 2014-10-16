@@ -864,7 +864,7 @@ index d03a080..2fbeddc 100644
  
  /**
 diff --git a/drivers/mmc/host/sdhci-acpi.c b/drivers/mmc/host/sdhci-acpi.c
-index 8c53370..a8a80eb 100644
+index 8c53370..85c7172 100644
 --- a/drivers/mmc/host/sdhci-acpi.c
 +++ b/drivers/mmc/host/sdhci-acpi.c
 @@ -35,6 +35,7 @@
@@ -892,7 +892,7 @@ index 8c53370..a8a80eb 100644
  };
  
  struct sdhci_acpi_host {
-@@ -101,10 +105,90 @@ static void sdhci_acpi_int_hw_reset(struct sdhci_host *host)
+@@ -101,10 +105,92 @@ static void sdhci_acpi_int_hw_reset(struct sdhci_host *host)
  	usleep_range(300, 1000);
  }
  
@@ -904,7 +904,7 @@ index 8c53370..a8a80eb 100644
 +	struct acpi_device_info *info;
 +	const char *hid, *uid = NULL;
 +	acpi_status status;
-+	int tuning_count = 0;
++	int tuning_count = 8;
 +
 +	if (!c || !c->pdev)
 +		return 0;
@@ -917,6 +917,8 @@ index 8c53370..a8a80eb 100644
 +	status = acpi_get_object_info(handle, &info);
 +	if (!ACPI_FAILURE(status) && (info->valid & ACPI_VALID_UID))
 +		uid = info->unique_id.string;
++
++	printk("sdhc-acpi: got acpi turning parm: %s %s\n", uid, hid);
 +
 +	if (!strcmp(hid, "80860F14") && !strcmp(uid, "1"))
 +		tuning_count = 8;
@@ -983,7 +985,12 @@ index 8c53370..a8a80eb 100644
  	.reset = sdhci_reset,
  	.set_uhs_signaling = sdhci_set_uhs_signaling,
  };
-@@ -126,17 +210,19 @@ static const struct sdhci_acpi_slot sdhci_acpi_slot_int_emmc = {
+@@ -122,26 +208,31 @@ static const struct sdhci_acpi_chip sdhci_acpi_chip_int = {
+ 	.ops = &sdhci_acpi_ops_int,
+ };
+ 
++//TODO: ADMA seems broken on 64bit. no clue why, can enable for 32bit though
+ static const struct sdhci_acpi_slot sdhci_acpi_slot_int_emmc = {
  	.chip    = &sdhci_acpi_chip_int,
  	.caps    = MMC_CAP_8_BIT_DATA | MMC_CAP_NONREMOVABLE |
  		   MMC_CAP_HW_RESET | MMC_CAP_1_8V_DDR,
@@ -991,14 +998,16 @@ index 8c53370..a8a80eb 100644
 +	.caps2   = MMC_CAP2_HC_ERASE_SZ | MMC_CAP2_HS200_1_8V_SDR,
  	.flags   = SDHCI_ACPI_RUNTIME_PM,
 -	.quirks2 = SDHCI_QUIRK2_PRESET_VALUE_BROKEN,
++	.quirks = SDHCI_QUIRK_BROKEN_ADMA,
 +	.quirks2 = SDHCI_QUIRK2_CARD_CD_DELAY | SDHCI_QUIRK2_WAIT_FOR_IDLE |
 +		SDHCI_QUIRK2_PRESET_VALUE_BROKEN | SDHCI_QUIRK2_TUNING_POLL,
 +        .probe_slot = sdhci_acpi_emmc_probe_slot,
  };
  
  static const struct sdhci_acpi_slot sdhci_acpi_slot_int_sdio = {
- 	.quirks  = SDHCI_QUIRK_BROKEN_CARD_DETECTION,
+-	.quirks  = SDHCI_QUIRK_BROKEN_CARD_DETECTION,
 -	.quirks2 = SDHCI_QUIRK2_HOST_OFF_CARD_ON,
++	.quirks  = SDHCI_QUIRK_BROKEN_CARD_DETECTION | SDHCI_QUIRK_BROKEN_ADMA,
 +        .quirks2 = SDHCI_QUIRK2_HOST_OFF_CARD_ON | SDHCI_QUIRK2_BROKEN_POWER_ENABLE,
  	.caps    = MMC_CAP_NONREMOVABLE | MMC_CAP_POWER_OFF_CARD,
 -	.flags   = SDHCI_ACPI_RUNTIME_PM,
@@ -1008,7 +1017,13 @@ index 8c53370..a8a80eb 100644
  };
  
  static const struct sdhci_acpi_slot sdhci_acpi_slot_int_sd = {
-@@ -277,6 +363,12 @@ static int sdhci_acpi_probe(struct platform_device *pdev)
+ 	.flags   = SDHCI_ACPI_SD_CD | SDHCI_ACPI_SD_CD_OVERRIDE_LEVEL |
+ 		   SDHCI_ACPI_RUNTIME_PM,
++	.quirks = SDHCI_QUIRK_BROKEN_ADMA,
+ 	.quirks2 = SDHCI_QUIRK2_CARD_ON_NEEDS_BUS_ON,
+ };
+ 
+@@ -277,6 +368,12 @@ static int sdhci_acpi_probe(struct platform_device *pdev)
  	}
  
  	if (c->slot) {
@@ -1022,7 +1037,7 @@ index 8c53370..a8a80eb 100644
  			host->ops            = c->slot->chip->ops;
  			host->quirks        |= c->slot->chip->quirks;
 diff --git a/drivers/mmc/host/sdhci.c b/drivers/mmc/host/sdhci.c
-index 37b2a9a..5c26a20 100644
+index 37b2a9a..d71e475 100644
 --- a/drivers/mmc/host/sdhci.c
 +++ b/drivers/mmc/host/sdhci.c
 @@ -29,6 +29,7 @@
@@ -1123,7 +1138,21 @@ index 37b2a9a..5c26a20 100644
  
  		cmd.opcode = opcode;
  		cmd.arg = 0;
-@@ -1931,12 +1970,25 @@ static int sdhci_execute_tuning(struct mmc_host *mmc, u32 opcode)
+@@ -1895,8 +1934,12 @@ static int sdhci_execute_tuning(struct mmc_host *mmc, u32 opcode)
+ 		cmd.data = NULL;
+ 		cmd.error = 0;
+ 
+-		if (tuning_loop_counter-- == 0)
++		if (timeout == 0  && tuning_loop_counter == 0)
+ 			break;
++		if (timeout)
++			timeout--;
++		if (tuning_loop_counter)
++			tuning_loop_counter--;
+ 
+ 		mrq.cmd = &cmd;
+ 		host->mrq = &mrq;
+@@ -1931,12 +1974,25 @@ static int sdhci_execute_tuning(struct mmc_host *mmc, u32 opcode)
  		host->cmd = NULL;
  		host->mrq = NULL;
  
@@ -1153,17 +1182,16 @@ index 37b2a9a..5c26a20 100644
  
  		if (!host->tuning_done) {
  			pr_info(DRIVER_NAME ": Timeout waiting for "
-@@ -1954,6 +2006,9 @@ static int sdhci_execute_tuning(struct mmc_host *mmc, u32 opcode)
- 
- 		host->tuning_done = 0;
- 
-+		if (timeout)
-+			timeout--;
-+
- 		ctrl = sdhci_readw(host, SDHCI_HOST_CONTROL2);
- 
- 		/* eMMC spec does not require a delay between tuning cycles */
-@@ -2064,6 +2119,8 @@ static void sdhci_card_event(struct mmc_host *mmc)
+@@ -1965,7 +2021,7 @@ static int sdhci_execute_tuning(struct mmc_host *mmc, u32 opcode)
+ 	 * The Host Driver has exhausted the maximum number of loops allowed,
+ 	 * so use fixed sampling frequency.
+ 	 */
+-	if (tuning_loop_counter < 0) {
++	if (!tuning_loop_counter && !timeout) {
+ 		ctrl &= ~SDHCI_CTRL_TUNED_CLK;
+ 		sdhci_writew(host, ctrl, SDHCI_HOST_CONTROL2);
+ 	}
+@@ -2064,6 +2120,8 @@ static void sdhci_card_event(struct mmc_host *mmc)
  		pr_err("%s: Resetting controller.\n",
  			mmc_hostname(host->mmc));
  
@@ -1172,7 +1200,7 @@ index 37b2a9a..5c26a20 100644
  		sdhci_do_reset(host, SDHCI_RESET_CMD);
  		sdhci_do_reset(host, SDHCI_RESET_DATA);
  
-@@ -2133,6 +2190,8 @@ static void sdhci_tasklet_finish(unsigned long param)
+@@ -2133,6 +2191,8 @@ static void sdhci_tasklet_finish(unsigned long param)
  
  		/* Spec says we should do both at the same time, but Ricoh
  		   controllers do not like that. */
@@ -1181,7 +1209,34 @@ index 37b2a9a..5c26a20 100644
  		sdhci_do_reset(host, SDHCI_RESET_CMD);
  		sdhci_do_reset(host, SDHCI_RESET_DATA);
  	}
-@@ -2574,6 +2633,29 @@ int sdhci_resume_host(struct sdhci_host *host)
+@@ -2441,8 +2501,25 @@ static irqreturn_t sdhci_irq(int irq, void *dev_id)
+ 			result = IRQ_WAKE_THREAD;
+ 		}
+ 
+-		if (intmask & SDHCI_INT_CMD_MASK)
++#define  SDHCI_INT_CMD_CONFLICT        0x00030000
++		if (intmask & SDHCI_INT_CMD_MASK){
++               		/*
++                	* If encounter command conflict interrupts,
++                	* before clearing it, delay 64 clocks, otherwise the interrupts
++                	* will be generated again.
++                	* This is just experience. SDHC spec doesn't
++                	* say the command conflict interrupts will be generated
++                	* again without a delay before clearing them.
++                	*/
++               		if ((intmask & SDHCI_INT_CMD_CONFLICT) ==
++                               SDHCI_INT_CMD_CONFLICT) {
++                       		if (host->clock)
++                               		udelay(64 * 1000000 / host->clock);
++                       		else
++                               		udelay(500);
++               		}
+ 			sdhci_cmd_irq(host, intmask & SDHCI_INT_CMD_MASK);
++		}
+ 
+ 		if (intmask & SDHCI_INT_DATA_MASK)
+ 			sdhci_data_irq(host, intmask & SDHCI_INT_DATA_MASK);
+@@ -2574,6 +2651,29 @@ int sdhci_resume_host(struct sdhci_host *host)
  {
  	int ret = 0;
  
@@ -1211,7 +1266,7 @@ index 37b2a9a..5c26a20 100644
  	if (host->flags & (SDHCI_USE_SDMA | SDHCI_USE_ADMA)) {
  		if (host->ops->enable_dma)
  			host->ops->enable_dma(host);
-@@ -2653,6 +2735,10 @@ int sdhci_runtime_suspend_host(struct sdhci_host *host)
+@@ -2653,6 +2753,10 @@ int sdhci_runtime_suspend_host(struct sdhci_host *host)
  		host->flags &= ~SDHCI_NEEDS_RETUNING;
  	}
  
@@ -1222,7 +1277,7 @@ index 37b2a9a..5c26a20 100644
  	spin_lock_irqsave(&host->lock, flags);
  	host->ier &= SDHCI_INT_CARD_INT;
  	sdhci_writel(host, host->ier, SDHCI_INT_ENABLE);
-@@ -2674,6 +2760,30 @@ int sdhci_runtime_resume_host(struct sdhci_host *host)
+@@ -2674,6 +2778,30 @@ int sdhci_runtime_resume_host(struct sdhci_host *host)
  	unsigned long flags;
  	int host_flags = host->flags;
  
@@ -1253,7 +1308,7 @@ index 37b2a9a..5c26a20 100644
  	if (host_flags & (SDHCI_USE_SDMA | SDHCI_USE_ADMA)) {
  		if (host->ops->enable_dma)
  			host->ops->enable_dma(host);
-@@ -2711,6 +2821,10 @@ int sdhci_runtime_resume_host(struct sdhci_host *host)
+@@ -2711,6 +2839,10 @@ int sdhci_runtime_resume_host(struct sdhci_host *host)
  
  	spin_unlock_irqrestore(&host->lock, flags);
  
@@ -1264,7 +1319,7 @@ index 37b2a9a..5c26a20 100644
  	return 0;
  }
  EXPORT_SYMBOL_GPL(sdhci_runtime_resume_host);
-@@ -2816,6 +2930,18 @@ int sdhci_add_host(struct sdhci_host *host)
+@@ -2816,6 +2948,18 @@ int sdhci_add_host(struct sdhci_host *host)
  		}
  	}
  
@@ -1283,7 +1338,7 @@ index 37b2a9a..5c26a20 100644
  	if (host->flags & SDHCI_USE_ADMA) {
  		/*
  		 * We need to allocate descriptors for all sg entries
-@@ -3027,6 +3153,9 @@ int sdhci_add_host(struct sdhci_host *host)
+@@ -3027,6 +3171,9 @@ int sdhci_add_host(struct sdhci_host *host)
  	host->tuning_count = (caps[1] & SDHCI_RETUNING_TIMER_COUNT_MASK) >>
  			      SDHCI_RETUNING_TIMER_COUNT_SHIFT;
  
@@ -1293,7 +1348,7 @@ index 37b2a9a..5c26a20 100644
  	/*
  	 * In case Re-tuning Timer is not disabled, the actual value of
  	 * re-tuning timer will be 2 ^ (n - 1).
-@@ -3292,6 +3421,10 @@ void sdhci_remove_host(struct sdhci_host *host, int dead)
+@@ -3292,6 +3439,10 @@ void sdhci_remove_host(struct sdhci_host *host, int dead)
  	if (!IS_ERR(mmc->supply.vqmmc))
  		regulator_disable(mmc->supply.vqmmc);
  
